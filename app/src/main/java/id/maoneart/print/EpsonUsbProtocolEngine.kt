@@ -1,15 +1,17 @@
 package id.maoneart.print
 
 import android.graphics.Bitmap
-import android.graphics.Color
 import java.io.ByteArrayOutputStream
+import java.util.Calendar
+import kotlin.math.ceil
+import kotlin.math.floor
 import kotlin.math.min
 import kotlin.math.roundToInt
 
 object EpsonUsbProtocolEngine {
 
     /**
-     * Resolves which protocol to use when AUTO is selected based on USB printer metadata.
+     * Resolves which protocol to use when AUTO is selected based on USB IEEE-1284 Device ID & model name.
      */
     fun resolveActiveProtocol(
         configured: EpsonDriverProtocol,
@@ -20,57 +22,62 @@ object EpsonUsbProtocolEngine {
         if (paperSize == PaperSizeOption.THERMAL_58) return EpsonDriverProtocol.ESCPOS_58
         if (paperSize == PaperSizeOption.THERMAL_80) return EpsonDriverProtocol.ESCPOS_80
 
+        val cmdUpper = (printer?.ieee1284Cmd ?: "").uppercase()
         val nameUpper = (printer?.displayName ?: "").uppercase()
-        return when {
-            nameUpper.contains("TM-") || nameUpper.contains("THERMAL") || nameUpper.contains("POS") -> {
-                EpsonDriverProtocol.ESCPOS_80
+
+        if (nameUpper.contains("TM-") || nameUpper.contains("THERMAL") || nameUpper.contains("POS")) {
+            return EpsonDriverProtocol.ESCPOS_80
+        }
+
+        // If we read IEEE 1284 CMD string from the printer firmware over USB control transfer:
+        if (cmdUpper.isNotEmpty()) {
+            if (cmdUpper.contains("ESCPR")) {
+                return EpsonDriverProtocol.ESCPR
             }
-            nameUpper.contains("LX-") || nameUpper.contains("LQ-") -> {
-                EpsonDriverProtocol.ESCP2
-            }
-            else -> {
-                // Default for Epson L120, L121, L1110, L3110, L3210, L3250, L3150, L805, EcoTank, Stylus
-                EpsonDriverProtocol.ESCPR
+            if (cmdUpper.contains("ESCPL2")) {
+                return EpsonDriverProtocol.ESCP2
             }
         }
+
+        // Fallback model-based detection for older ESCPL2-only models vs ESC/P-R models:
+        val escpl2OnlyModels = listOf("L110", "L120", "L210", "L300", "L350", "L355", "L550", "L555", "LX-", "LQ-")
+        if (escpl2OnlyModels.any { nameUpper.contains(it) }) {
+            return EpsonDriverProtocol.ESCP2
+        }
+
+        return EpsonDriverProtocol.ESCPR
     }
 
     /**
-     * Target pixel dimensions (width, height) for a given protocol, paper size, and quality.
+     * Target printable pixel dimensions (printableWidth, printableHeight) at 360 DPI.
      */
     fun getTargetPixelDimensions(
         protocol: EpsonDriverProtocol,
-        paperSize: PaperSizeOption
+        paperSize: PaperSizeOption,
+        borderless: Boolean = false
     ): Pair<Int, Int> {
         return when (protocol) {
             EpsonDriverProtocol.ESCPOS_58 -> 384 to (384 * (paperSize.heightMm / paperSize.widthMm)).roundToInt()
             EpsonDriverProtocol.ESCPOS_80 -> 576 to (576 * (paperSize.heightMm / paperSize.widthMm)).roundToInt()
             EpsonDriverProtocol.ESCPR, EpsonDriverProtocol.ESCP2, EpsonDriverProtocol.AUTO -> {
-                // 360 DPI standard Epson raster grid (360 dots per 25.4 mm)
-                val dpi = 360f
-                val wPx = ((paperSize.widthMm / 25.4f) * dpi).roundToInt()
-                val hPx = ((paperSize.heightMm / 25.4f) * dpi).roundToInt()
-                wPx to hPx
+                val dpi = 360.0
+                val mm2in = 1.0 / 25.4
+                val paperW = ceil(paperSize.widthMm * mm2in * dpi).toInt()
+                val paperH = ceil(paperSize.heightMm * mm2in * dpi).toInt()
+                val margin = if (borderless) 0 else floor(3.0 * mm2in * dpi).toInt() // 42 dots (3mm)
+                val printableW = (paperW - margin * 2).coerceAtLeast(100)
+                val printableH = (paperH - margin * 2).coerceAtLeast(100)
+                printableW to printableH
             }
         }
     }
 
     /**
-     * Sends a complete ESC/P-R job header (Exit Packet Mode + Remote Mode + ESCPRJ + 'job ' command).
+     * Builds the REMOTE1 session initialization sequence shared by ESC/P-R and ESCPL2.
+     * Matches real Epson L3110 USB capture (TI, JS, JH, HD, PP, Exit REMOTE1).
      */
-    fun buildEscprJobStart(
-        pageWidthPx: Int,
-        pageHeightPx: Int,
-        config: PrintJobConfig
-    ): ByteArray {
-        val out = ByteArrayOutputStream(256)
-
-        // 1. Exit IEEE 1284.4 Packet Mode & Reset Printer
-        out.write(byteArrayOf(0x00, 0x00, 0x00))
-        out.write("\u001b\u0001@EJL 1284.4\n@EJL     \n".toByteArray(Charsets.US_ASCII))
-        out.write(byteArrayOf(0x1B, 0x40)) // ESC @
-
-        // 2. Enter Remote Mode & PM
+    private fun writeRemote1JobSetup(out: ByteArrayOutputStream, jobName: String = "ESCPRLib") {
+        // Enter REMOTE1 mode: ESC ( R 08 00 00 REMOTE1
         out.write(
             byteArrayOf(
                 0x1B, 0x28, 0x52, 0x08, 0x00, 0x00,
@@ -78,73 +85,198 @@ object EpsonUsbProtocolEngine {
                 'O'.code.toByte(), 'T'.code.toByte(), 'E'.code.toByte(), '1'.code.toByte()
             )
         )
-        // PM command
-        out.write(byteArrayOf('P'.code.toByte(), 'M'.code.toByte(), 0x02, 0x00, 0x00, 0x00))
-        // Exit Remote Mode: ESC 0x00 0x00 0x00
-        out.write(byteArrayOf(0x1B, 0x00, 0x00, 0x00))
 
-        // 3. Enter ESC/P-R Mode: ESC ( R 07 00 00 ESCPRJ
-        out.write(
+        // 1. TI (Time Init): "TI" + len(8 LE) + resp(0) + YYYY(BE16) + MM + DD + hh + mm + ss
+        val cal = Calendar.getInstance()
+        val year = cal.get(Calendar.YEAR)
+        val month = cal.get(Calendar.MONTH) + 1
+        val day = cal.get(Calendar.DAY_OF_MONTH)
+        val hour = cal.get(Calendar.HOUR_OF_DAY)
+        val minute = cal.get(Calendar.MINUTE)
+        val second = cal.get(Calendar.SECOND)
+        writeRemote1Cmd(
+            out,
+            "TI",
             byteArrayOf(
-                0x1B, 0x28, 0x52, 0x07, 0x00, 0x00,
-                'E'.code.toByte(), 'S'.code.toByte(), 'C'.code.toByte(),
-                'P'.code.toByte(), 'R'.code.toByte(), 'J'.code.toByte()
+                ((year shr 8) and 0xFF).toByte(),
+                (year and 0xFF).toByte(),
+                month.toByte(),
+                day.toByte(),
+                hour.toByte(),
+                minute.toByte(),
+                second.toByte()
             )
         )
 
-        // 4. Send 'job ' command (Class 'j', 21 parameter bytes)
-        val margin = if (config.scaleMode == ScaleFitMode.MARGINLESS) 0 else 42 // ~3mm at 360dpi
-        val printableW = (pageWidthPx - margin * 2).coerceAtLeast(100)
-        val printableH = (pageHeightPx - margin * 2).coerceAtLeast(100)
+        // 2. JS (Job Start): "JS" + len(4 LE) + resp(0) + 00 00 00
+        writeRemote1Cmd(out, "JS", byteArrayOf(0x00, 0x00, 0x00))
 
-        val jobParams = ByteArrayOutputStream(21)
-        writeInt32BE(jobParams, pageWidthPx)
-        writeInt32BE(jobParams, pageHeightPx)
-        writeInt16BE(jobParams, margin)
-        writeInt16BE(jobParams, margin)
-        writeInt32BE(jobParams, printableW)
-        writeInt32BE(jobParams, printableH)
-        jobParams.write(0x01) // 360x360 DPI input resolution
-        jobParams.write(0x01) // Bi-directional printing
-        jobParams.write(if (config.colorMode == ColorModeOption.BLACK_WHITE) 0x01 else 0x00) // 0=RGB, 1=Mono
-        val qualityCode = when (config.quality) {
+        // 3. JH (Job Header): "JH" + len + resp(0) + jobType(0) + jobId(4B BE=0) + "ESCPRLib"
+        val nameBytes = jobName.toByteArray(Charsets.US_ASCII)
+        val jhData = ByteArray(5 + nameBytes.size)
+        System.arraycopy(nameBytes, 0, jhData, 5, nameBytes.size)
+        writeRemote1Cmd(out, "JH", jhData)
+
+        // 4. HD (Hardware Device): "HD" + len(3 LE) + resp(0) + 03 04 (4 = Linux/Android)
+        writeRemote1Cmd(out, "HD", byteArrayOf(0x03, 0x04))
+
+        // 5. PP (Paper Path): "PP" + len(3 LE) + resp(0) + 01 FF (Rear/Auto paper feed)
+        writeRemote1Cmd(out, "PP", byteArrayOf(0x01, 0xFF.toByte()))
+
+        // Exit REMOTE1 mode: ESC 0x00 0x00 0x00
+        out.write(byteArrayOf(0x1B, 0x00, 0x00, 0x00))
+    }
+
+    private fun writeRemote1JobTeardown(out: ByteArrayOutputStream) {
+        out.write(
+            byteArrayOf(
+                0x1B, 0x28, 0x52, 0x08, 0x00, 0x00,
+                'R'.code.toByte(), 'E'.code.toByte(), 'M'.code.toByte(),
+                'O'.code.toByte(), 'T'.code.toByte(), 'E'.code.toByte(), '1'.code.toByte()
+            )
+        )
+        // LD (Load Defaults)
+        writeRemote1Cmd(out, "LD", ByteArray(0))
+        // JE (Job End)
+        writeRemote1Cmd(out, "JE", ByteArray(0))
+        // Exit REMOTE1 mode
+        out.write(byteArrayOf(0x1B, 0x00, 0x00, 0x00))
+    }
+
+    private fun writeRemote1Cmd(out: ByteArrayOutputStream, cmd2Char: String, data: ByteArray, response: Int = 0) {
+        val codeBytes = cmd2Char.toByteArray(Charsets.US_ASCII)
+        out.write(codeBytes, 0, 2)
+        val lenPlusResp = data.size + 1
+        out.write(lenPlusResp and 0xFF)
+        out.write((lenPlusResp shr 8) and 0xFF)
+        out.write(response and 0xFF)
+        if (data.isNotEmpty()) {
+            out.write(data)
+        }
+    }
+
+    /**
+     * Builds the exact ESC/P-R Job Start sequence verified from Epson L3110 USB capture & python-epson:
+     * 1. Exit Packet Mode (`@EJL 1284.4`) + `ESC @`
+     * 2. `REMOTE1` setup (`TI`, `JS`, `JH`, `HD`, `PP`, Exit)
+     * 3. Enter ESC/P-R Raster Mode: `ESC ( R 06 00 00 ESCPR` (6 bytes, NOT ESCPRJ!)
+     * 4. `setq` (Class 'q', 9 bytes: mtid, mqid, cm, brightness, contrast, saturation, cp=0, paletteLen=0)
+     * 5. `setj` (Class 'j', 22 bytes: paperW, paperH, topMargin, leftMargin, printableW, printableH, ir=0 (360dpi), pd=0)
+     */
+    fun buildEscprJobStart(
+        config: PrintJobConfig
+    ): ByteArray {
+        val out = ByteArrayOutputStream(512)
+
+        // 1. Exit IEEE 1284.4 Packet Mode & Initialize Printer
+        out.write(byteArrayOf(0x00, 0x00, 0x00))
+        out.write("\u001b\u0001@EJL 1284.4\n@EJL     \n".toByteArray(Charsets.US_ASCII))
+        out.write(byteArrayOf(0x1B, 0x40)) // ESC @
+
+        // 2. REMOTE1 Handshake
+        writeRemote1JobSetup(out, "ESCPRLib")
+
+        // 3. Enter ESC/P-R Raster Mode: ESC ( R 06 00 00 ESCPR
+        out.write(
+            byteArrayOf(
+                0x1B, 0x28, 0x52, 0x06, 0x00, 0x00,
+                'E'.code.toByte(), 'S'.code.toByte(), 'C'.code.toByte(),
+                'P'.code.toByte(), 'R'.code.toByte()
+            )
+        )
+
+        // 4. Send 'setq' (Class 'q', length = 9 bytes)
+        val mtid: Byte = if (config.paperSize == PaperSizeOption.PHOTO_4R || config.paperSize == PaperSizeOption.PHOTO_5R) {
+            0x0B // PGPHOTO (Glossy Photo Paper)
+        } else {
+            0x00 // PLAIN Paper
+        }
+        val mqid: Byte = when (config.quality) {
             PrintQualityOption.DRAFT -> 0x00
             PrintQualityOption.NORMAL -> 0x01
             PrintQualityOption.HIGH -> 0x02
         }
-        jobParams.write(qualityCode)
-        val mediaType = if (config.paperSize == PaperSizeOption.PHOTO_4R || config.paperSize == PaperSizeOption.PHOTO_5R) {
-            0x0B // Photo Paper
+        val cm: Byte = if (config.colorMode == ColorModeOption.BLACK_WHITE) 0x01 else 0x00
+        val setqParams = byteArrayOf(
+            mtid,
+            mqid,
+            cm,
+            0x00, // brightness
+            0x00, // contrast
+            0x00, // saturation
+            0x00, // cp = CP.FULLCOLOR (24-bit RGB, 3 bytes per pixel)
+            0x00, 0x00 // palette length = 0 (uint16 BE)
+        )
+        writeEscprCommand(out, 'q', "setq", setqParams)
+
+        // 5. Send 'setj' (Class 'j', length = 22 bytes: >LLHHLLBB)
+        val dpi = 360.0
+        val mm2in = 1.0 / 25.4
+        val wMm = if (config.orientation == PageOrientation.LANDSCAPE) {
+            maxOf(config.paperSize.widthMm, config.paperSize.heightMm)
         } else {
-            0x00 // Plain Paper
+            minOf(config.paperSize.widthMm, config.paperSize.heightMm)
         }
-        jobParams.write(mediaType)
+        val hMm = if (config.orientation == PageOrientation.LANDSCAPE) {
+            minOf(config.paperSize.widthMm, config.paperSize.heightMm)
+        } else {
+            maxOf(config.paperSize.widthMm, config.paperSize.heightMm)
+        }
 
-        writeEscprCommand(out, 'j', "job ", jobParams.toByteArray())
-        return out.toByteArray()
-    }
+        val paperWidth = ceil(wMm * mm2in * dpi).toInt()
+        val paperHeight = ceil(hMm * mm2in * dpi).toInt()
+        val margin = if (config.scaleMode == ScaleFitMode.MARGINLESS) 0 else floor(3.0 * mm2in * dpi).toInt() // 42 dots
+        val printableWidth = (paperWidth - margin * 2).coerceAtLeast(100)
+        val printableHeight = (paperHeight - margin * 2).coerceAtLeast(100)
 
-    fun buildEscprPageStart(): ByteArray {
-        val out = ByteArrayOutputStream(32)
-        writeEscprCommand(out, 'p', "sttp", ByteArray(0))
-        return out.toByteArray()
-    }
+        val setjParams = ByteArrayOutputStream(22)
+        writeInt32BE(setjParams, paperWidth)
+        writeInt32BE(setjParams, paperHeight)
+        writeInt16BE(setjParams, margin) // marginTop
+        writeInt16BE(setjParams, margin) // marginLeft
+        writeInt32BE(setjParams, printableWidth)
+        writeInt32BE(setjParams, printableHeight)
+        setjParams.write(0x00) // ir = 0 (360 DPI! Note: 1 is 720 DPI)
+        setjParams.write(0x00) // pd = 0 (Bi-directional)
 
-    fun buildEscprPageEnd(hasNextPage: Boolean): ByteArray {
-        val out = ByteArrayOutputStream(32)
-        writeEscprCommand(out, 'p', "endp", byteArrayOf(if (hasNextPage) 0x01 else 0x00))
-        return out.toByteArray()
-    }
-
-    fun buildEscprJobEnd(): ByteArray {
-        val out = ByteArrayOutputStream(32)
-        writeEscprCommand(out, 'j', "endj", ByteArray(0))
-        out.write(byteArrayOf(0x1B, 0x40)) // Reset printer
+        writeEscprCommand(out, 'j', "setj", setjParams.toByteArray())
         return out.toByteArray()
     }
 
     /**
-     * Streams a full page Bitmap using ESC/P-R 'dsnd' scanlines in batches so USB transfers are fast and cancellable.
+     * Starts an ESC/P-R page (`sttp` + `setn`).
+     */
+    fun buildEscprPageStart(pageNumber: Int = 1): ByteArray {
+        val out = ByteArrayOutputStream(32)
+        writeEscprCommand(out, 'p', "sttp", ByteArray(0))
+        writeEscprCommand(out, 'p', "setn", byteArrayOf(pageNumber.coerceIn(1, 99).toByte()))
+        return out.toByteArray()
+    }
+
+    /**
+     * Ends an ESC/P-R page (`endp` with remaining pages count).
+     */
+    fun buildEscprPageEnd(remainingPages: Int): ByteArray {
+        val out = ByteArrayOutputStream(32)
+        writeEscprCommand(out, 'p', "endp", byteArrayOf(remainingPages.coerceIn(0, 99).toByte()))
+        return out.toByteArray()
+    }
+
+    /**
+     * Ends an ESC/P-R job (`endj` + `ESC @` + `REMOTE1 LD/JE`).
+     */
+    fun buildEscprJobEnd(): ByteArray {
+        val out = ByteArrayOutputStream(128)
+        writeEscprCommand(out, 'j', "endj", ByteArray(0))
+        out.write(byteArrayOf(0x1B, 0x40)) // ESC @
+        writeRemote1JobTeardown(out)
+        return out.toByteArray()
+    }
+
+    /**
+     * Streams a full page Bitmap using ESC/P-R `dsnd` scanlines.
+     * Note: Since `cp = 0` (CP.FULLCOLOR) in `setq`, each pixel is always 3 bytes (R, G, B)
+     * compressed with 3-byte PackBits RLE (`encodeRgbRleLine`), both in Color and Grayscale modes.
      */
     suspend fun streamEscprPageBitmap(
         bitmap: Bitmap,
@@ -155,7 +287,6 @@ object EpsonUsbProtocolEngine {
     ): Boolean {
         val width = bitmap.width
         val height = bitmap.height
-        val isMono = config.colorMode == ColorModeOption.BLACK_WHITE
         val rowPixels = IntArray(width)
         val batchBuffer = ByteArrayOutputStream(32768)
 
@@ -164,7 +295,7 @@ object EpsonUsbProtocolEngine {
 
             bitmap.getPixels(rowPixels, 0, width, 0, y, width, 1)
 
-            // Trim pure white pixels on left & right of scanline
+            // Find first and last non-white pixel on this row
             var firstNonWhite = -1
             var lastNonWhite = -1
             for (x in 0 until width) {
@@ -180,15 +311,10 @@ object EpsonUsbProtocolEngine {
 
             if (firstNonWhite != -1 && lastNonWhite >= firstNonWhite) {
                 val activeWidth = lastNonWhite - firstNonWhite + 1
-                val compressedLine = if (isMono) {
-                    encodeMonoRleLine(rowPixels, firstNonWhite, activeWidth)
-                } else {
-                    encodeRgbRleLine(rowPixels, firstNonWhite, activeWidth)
-                }
+                val compressedLine = encodeRgbRleLine(rowPixels, firstNonWhite, activeWidth)
 
-                // Build 'dsnd' parameter payload: xOffset(2 BE) + yOffset(2 BE) + compress(1) + dataLen(2 BE) + data
+                // 'dsnd' payload: xOffset(2 BE) + yOffset(2 BE) + cmode(1 = RLE) + dataLen(2 BE) + data
                 val paramLen = 7 + compressedLine.size
-                // Write ESC 'd' + length(4 LE) + "dsnd" + params
                 batchBuffer.write(0x1B)
                 batchBuffer.write('d'.code)
                 writeInt32LE(batchBuffer, paramLen)
@@ -199,7 +325,7 @@ object EpsonUsbProtocolEngine {
 
                 writeInt16BE(batchBuffer, firstNonWhite)
                 writeInt16BE(batchBuffer, y)
-                batchBuffer.write(0x01) // RLE compression enabled
+                batchBuffer.write(0x01) // cmode = 1 (RLE compressed)
                 writeInt16BE(batchBuffer, compressedLine.size)
                 batchBuffer.write(compressedLine)
 
@@ -222,10 +348,13 @@ object EpsonUsbProtocolEngine {
     }
 
     /**
-     * Streams a full page Bitmap using Universal Epson ESC/P2 Raster Graphics (`ESC i`) for legacy/standard mode.
+     * Streams a full page Bitmap using Epson ESCPL2 / ESC/P2 Extended Raster (`ESC ( D` + `ESC i`)
+     * for Epson L110, L120, L210, L300, L350, Stylus, etc.
+     * Matches `epson/escp.py` in `ezrec/python-epson`.
      */
     suspend fun streamEscp2PageBitmap(
         bitmap: Bitmap,
+        config: PrintJobConfig,
         isCancelled: () -> Boolean,
         onProgress: (Float) -> Unit,
         sendChunk: suspend (ByteArray) -> Boolean
@@ -234,16 +363,70 @@ object EpsonUsbProtocolEngine {
         val height = bitmap.height
         val bytesPerLine = (width + 7) / 8
 
-        val initOut = ByteArrayOutputStream(128)
+        val dpi = 360.0
+        val mm2in = 1.0 / 25.4
+        val wMm = if (config.orientation == PageOrientation.LANDSCAPE) {
+            maxOf(config.paperSize.widthMm, config.paperSize.heightMm)
+        } else {
+            minOf(config.paperSize.widthMm, config.paperSize.heightMm)
+        }
+        val hMm = if (config.orientation == PageOrientation.LANDSCAPE) {
+            minOf(config.paperSize.widthMm, config.paperSize.heightMm)
+        } else {
+            maxOf(config.paperSize.widthMm, config.paperSize.heightMm)
+        }
+
+        val paperW = ceil(wMm * mm2in * dpi).toInt()
+        val paperH = ceil(hMm * mm2in * dpi).toInt()
+        val margin = if (config.scaleMode == ScaleFitMode.MARGINLESS) 0 else floor(3.0 * mm2in * dpi).toInt()
+        val yTop = margin
+        val yBottom = (paperH - margin).coerceAtLeast(yTop + 100)
+
+        val initOut = ByteArrayOutputStream(256)
+        // 1. Exit packet mode
         initOut.write(byteArrayOf(0x00, 0x00, 0x00))
         initOut.write("\u001b\u0001@EJL 1284.4\n@EJL     \n".toByteArray(Charsets.US_ASCII))
-        initOut.write(byteArrayOf(0x1B, 0x40)) // ESC @ Initialize
-        // ESC ( G 1 0 1 -> Select Graphics Mode
+
+        // 2. REMOTE1 setup
+        writeRemote1JobSetup(initOut, "ESCPLib")
+
+        // 3. ESC @ Initialize printer
+        initOut.write(byteArrayOf(0x1B, 0x40))
+
+        // 4. ESC ( G 01 00 01 -> Enter Graphics Mode
         initOut.write(byteArrayOf(0x1B, 0x28, 0x47, 0x01, 0x00, 0x01))
-        // ESC ( U 1 0 10 -> Set unit to 1/360 inch (3600 / 360 = 10)
+
+        // 5. ESC ( U 01 00 0A -> Set unit to 1/360 inch (3600 / 360 = 10)
         initOut.write(byteArrayOf(0x1B, 0x28, 0x55, 0x01, 0x00, 0x0A))
-        // ESC U 0 -> Bi-directional printing
+
+        // 6. ESC U 00 -> Bi-directional printing
         initOut.write(byteArrayOf(0x1B, 0x55, 0x00))
+
+        // 7. ESC ( K 02 00 00 [cm: 1=Mono, 2=Color]
+        val escpColorMode: Byte = if (config.colorMode == ColorModeOption.BLACK_WHITE) 0x01 else 0x02
+        initOut.write(byteArrayOf(0x1B, 0x28, 0x4B, 0x02, 0x00, 0x00, escpColorMode))
+
+        // 8. ESC ( D 04 00 A0 05 04 04 -> Set Raster Resolution (base=1440, v=1440/360=4, h=1440/360=4)
+        // Crucial for 'ESC i' raster mode recognition!
+        initOut.write(byteArrayOf(0x1B, 0x28, 0x44, 0x04, 0x00, 0xA0.toByte(), 0x05, 0x04, 0x04))
+
+        // 9. ESC ( c 08 00 [yTop:4B LE] [yBottom:4B LE] -> Page Format v2
+        initOut.write(byteArrayOf(0x1B, 0x28, 0x63, 0x08, 0x00))
+        writeInt32LE(initOut, yTop)
+        writeInt32LE(initOut, yBottom)
+
+        // 10. ESC ( S 08 00 [paperW:4B LE] [paperH:4B LE] -> Paper Dimensions v2
+        initOut.write(byteArrayOf(0x1B, 0x28, 0x53, 0x08, 0x00))
+        writeInt32LE(initOut, paperW)
+        writeInt32LE(initOut, paperH)
+
+        // 11. ESC ( m 01 00 12 -> Print Method
+        initOut.write(byteArrayOf(0x1B, 0x28, 0x6D, 0x01, 0x00, 0x12))
+
+        // 12. ESC ( V 04 00 [yTop:4B LE] -> Set initial vertical position
+        initOut.write(byteArrayOf(0x1B, 0x28, 0x56, 0x04, 0x00))
+        writeInt32LE(initOut, yTop)
+
         if (!sendChunk(initOut.toByteArray())) return false
 
         val rowPixels = IntArray(width)
@@ -282,7 +465,6 @@ object EpsonUsbProtocolEngine {
                 }
             }
 
-            // Shift error buffers
             for (i in errCurr.indices) {
                 errCurr[i] = errNext[i]
                 errNext[i] = 0f
@@ -292,33 +474,31 @@ object EpsonUsbProtocolEngine {
                 pendingBlankLines++
             } else {
                 if (pendingBlankLines > 0) {
-                    // ESC ( v 2 0 nL nH -> Relative vertical position advance
-                    batchOut.write(
-                        byteArrayOf(
-                            0x1B, 0x28, 0x76, 0x02, 0x00,
-                            (pendingBlankLines and 0xFF).toByte(),
-                            ((pendingBlankLines shr 8) and 0xFF).toByte()
-                        )
-                    )
+                    // ESC ( v 04 00 [offset:4B LE] -> Relative vertical advance v2
+                    batchOut.write(byteArrayOf(0x1B, 0x28, 0x76, 0x04, 0x00))
+                    writeInt32LE(batchOut, pendingBlankLines)
                     pendingBlankLines = 0
                 }
 
+                // ESC ( $ 04 00 [marginLeft:4B LE] -> Set horizontal position v2
+                batchOut.write(byteArrayOf(0x1B, 0x28, 0x24, 0x04, 0x00))
+                writeInt32LE(batchOut, margin)
+
                 val rleBits = encodePackBits1Bit(lineBitBytes)
-                // ESC i color(0=Black) compress(1=RLE) bits(1) bytesL bytesH linesL(1) linesH(0) data
+                // ESC i color(0=Black) cmode(1=RLE) bpp(1) bytesPerLine(2B LE) lines(2B LE = 1) data
                 batchOut.write(
                     byteArrayOf(
                         0x1B, 0x69,
-                        0x00, // Black
+                        0x00, // K (Black)
                         0x01, // RLE compressed
                         0x01, // 1 bit per pixel
                         (bytesPerLine and 0xFF).toByte(),
                         ((bytesPerLine shr 8) and 0xFF).toByte(),
-                        0x01, 0x00
+                        0x01, 0x00 // 1 line
                     )
                 )
                 batchOut.write(rleBits)
-                batchOut.write(0x0D) // Carriage Return
-                pendingBlankLines = 1 // Advance 1 line for next row
+                pendingBlankLines = 1
 
                 if (batchOut.size() >= 16384) {
                     if (!sendChunk(batchOut.toByteArray())) return false
@@ -331,9 +511,10 @@ object EpsonUsbProtocolEngine {
             }
         }
 
-        // Flush remaining data + Form Feed (0x0C) + Reset (ESC @)
+        // Form Feed (0x0C) + ESC @ + REMOTE1 teardown
         batchOut.write(0x0C)
         batchOut.write(byteArrayOf(0x1B, 0x40))
+        writeRemote1JobTeardown(batchOut)
         return sendChunk(batchOut.toByteArray())
     }
 
@@ -350,7 +531,6 @@ object EpsonUsbProtocolEngine {
         val height = bitmap.height
         val bytesPerRow = (width + 7) / 8
 
-        // Trim bottom pure-white space on thermal receipts so it doesn't waste roll paper
         val pixels = IntArray(width * height)
         bitmap.getPixels(pixels, 0, width, 0, 0, width, height)
         var effectiveHeight = height
@@ -368,7 +548,6 @@ object EpsonUsbProtocolEngine {
         }
         effectiveHeight = min(height, effectiveHeight + 24)
 
-        // Initialize ESC @
         if (!sendChunk(byteArrayOf(0x1B, 0x40))) return false
 
         val bandHeight = 64
@@ -381,7 +560,6 @@ object EpsonUsbProtocolEngine {
             val currentBandH = min(bandHeight, effectiveHeight - y)
             val bandOut = ByteArrayOutputStream(8 + bytesPerRow * currentBandH)
 
-            // GS v 0 m xL xH yL yH
             bandOut.write(
                 byteArrayOf(
                     0x1D, 0x76, 0x30, 0x00,
@@ -432,13 +610,13 @@ object EpsonUsbProtocolEngine {
             onProgress(y.toFloat() / effectiveHeight.toFloat())
         }
 
-        // Feed 4 lines & Partial Cut (GS V 66 0)
         val finishCmd = byteArrayOf(0x1B, 0x64, 0x04, 0x1D, 0x56, 0x42, 0x00)
         return sendChunk(finishCmd)
     }
 
     /**
      * Encodes an RGB scanline segment using ESC/P-R 3-byte pixel PackBits RLE.
+     * Matches `run_length_encode(line, bytes_per_pixel=3)` in `ezrec/python-epson`.
      */
     private fun encodeRgbRleLine(pixels: IntArray, startOffset: Int, length: Int): ByteArray {
         val out = ByteArrayOutputStream(length * 3)
@@ -451,14 +629,14 @@ object EpsonUsbProtocolEngine {
             }
 
             if (runLen >= 2) {
-                // Repeat run: header = (257 - runLen)
+                // Repeated pixel run: control byte = (257 - runLen)
                 out.write((257 - runLen) and 0xFF)
                 out.write((baseColor shr 16) and 0xFF)
                 out.write((baseColor shr 8) and 0xFF)
                 out.write(baseColor and 0xFF)
                 i += runLen
             } else {
-                // Literal run up to 128 pixels
+                // Literal pixel sequence up to 128 pixels: control byte = (litLen - 1)
                 var litLen = 1
                 while (i + litLen < length && litLen < 128) {
                     val curr = pixels[startOffset + i + litLen] and 0xFFFFFF
@@ -477,21 +655,6 @@ object EpsonUsbProtocolEngine {
             }
         }
         return out.toByteArray()
-    }
-
-    /**
-     * Encodes a Monochrome Grayscale scanline segment using ESC/P-R 1-byte PackBits RLE.
-     */
-    private fun encodeMonoRleLine(pixels: IntArray, startOffset: Int, length: Int): ByteArray {
-        val grays = ByteArray(length)
-        for (idx in 0 until length) {
-            val c = pixels[startOffset + idx]
-            val r = (c shr 16) and 0xFF
-            val g = (c shr 8) and 0xFF
-            val b = c and 0xFF
-            grays[idx] = ((r * 77 + g * 150 + b * 29) shr 8).toByte()
-        }
-        return encodePackBits1Bit(grays)
     }
 
     private fun encodePackBits1Bit(data: ByteArray): ByteArray {

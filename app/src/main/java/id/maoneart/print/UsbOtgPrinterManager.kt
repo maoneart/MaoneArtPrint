@@ -90,7 +90,16 @@ class UsbOtgPrinterManager(private val context: Context) {
 
             if (isEpson || hasPrinterInterface) {
                 val hasPerm = usbManager.hasPermission(device)
-                val prodName = try {
+                var ieee1284Model: String? = null
+                var ieee1284Cmd = ""
+
+                if (hasPerm) {
+                    val (mdl, cmd) = queryIeee1284DeviceId(device)
+                    ieee1284Model = mdl
+                    ieee1284Cmd = cmd
+                }
+
+                val prodName = ieee1284Model ?: try {
                     device.productName?.takeIf { it.isNotBlank() }
                 } catch (_: SecurityException) {
                     null
@@ -111,7 +120,9 @@ class UsbOtgPrinterManager(private val context: Context) {
 
                 val category = when {
                     displayTitle.uppercase().contains("TM-") -> "Epson Thermal POS (ESC/POS)"
-                    isEpson -> "Epson Inkjet / EcoTank (ESC/P-R)"
+                    ieee1284Cmd.uppercase().contains("ESCPR") -> "Epson ESC/P-R Raster (${ieee1284Cmd.take(18)})"
+                    ieee1284Cmd.uppercase().contains("ESCPL2") -> "Epson ESC/P2 Raster (${ieee1284Cmd.take(18)})"
+                    isEpson -> "Epson Inkjet / EcoTank (USB OTG)"
                     else -> "Printer USB OTG"
                 }
 
@@ -124,7 +135,8 @@ class UsbOtgPrinterManager(private val context: Context) {
                         productId = device.productId,
                         isEpson = isEpson,
                         hasPermission = hasPerm,
-                        detectedCategory = category
+                        detectedCategory = category,
+                        ieee1284Cmd = ieee1284Cmd
                     )
                 )
 
@@ -134,13 +146,53 @@ class UsbOtgPrinterManager(private val context: Context) {
             }
         }
 
-        // Prioritize Epson printers first
         found.sortByDescending { it.isEpson }
         _connectedPrinters.value = found
 
         val currentSel = _selectedPrinter.value
         val updatedSelection = found.find { it.deviceName == currentSel?.deviceName } ?: found.firstOrNull()
         _selectedPrinter.value = updatedSelection
+    }
+
+    /**
+     * Queries the IEEE 1284 Device ID string from the USB Printer Class interface (Class 7).
+     * Returns Pair(ModelName?, CmdCapabilitiesString).
+     */
+    private fun queryIeee1284DeviceId(device: UsbDevice): Pair<String?, String> {
+        val pair = findPrinterEndpoint(device) ?: return null to ""
+        val (intf, _) = pair
+        val conn = usbManager.openDevice(device) ?: return null to ""
+        return try {
+            val buffer = ByteArray(1024)
+            // USB Printer Class GET_DEVICE_ID: bmRequestType=0xA1, bRequest=0x00, wValue=0x0000, wIndex=(interfaceId)
+            val len = conn.controlTransfer(0xA1, 0x00, 0x0000, intf.id, buffer, buffer.size, 1500)
+            if (len > 2) {
+                val strLen = (((buffer[0].toInt() and 0xFF) shl 8) or (buffer[1].toInt() and 0xFF))
+                    .coerceIn(0, min(len - 2, buffer.size - 2))
+                val rawId = String(buffer, 2, if (strLen > 0) strLen else (len - 2), Charsets.US_ASCII)
+                var mdl: String? = null
+                var cmd = ""
+                rawId.split(";").forEach { token ->
+                    val kv = token.split(":", limit = 2)
+                    if (kv.size == 2) {
+                        val k = kv[0].trim().uppercase()
+                        val v = kv[1].trim()
+                        if (k == "MDL" || k == "MODEL") mdl = v
+                        if (k == "CMD" || k == "COMMAND SET") cmd = v
+                    }
+                }
+                mdl to cmd
+            } else {
+                null to ""
+            }
+        } catch (_: Exception) {
+            null to ""
+        } finally {
+            try {
+                conn.close()
+            } catch (_: Exception) {
+            }
+        }
     }
 
     fun selectPrinter(printer: ConnectedUsbPrinter) {
@@ -194,7 +246,7 @@ class UsbOtgPrinterManager(private val context: Context) {
     }
 
     private fun findPrinterEndpoint(device: UsbDevice): Pair<UsbInterface, UsbEndpoint>? {
-        // First pass: look specifically for USB_CLASS_PRINTER (Class 7) with Bulk OUT
+        // First pass: look specifically for USB_CLASS_PRINTER (Class 7, Interface 1 on MFP like L3110/L3210)
         for (i in 0 until device.interfaceCount) {
             val intf = device.getInterface(i)
             if (intf.interfaceClass == UsbConstants.USB_CLASS_PRINTER) {
@@ -206,8 +258,8 @@ class UsbOtgPrinterManager(private val context: Context) {
                 }
             }
         }
-        // Fallback: any interface with Bulk OUT endpoint
-        for (i in 0 until device.interfaceCount) {
+        // Fallback: any interface with Bulk OUT endpoint that isn't Interface 0 Scanner when multiple exist
+        for (i in (device.interfaceCount - 1) downTo 0) {
             val intf = device.getInterface(i)
             for (e in 0 until intf.endpointCount) {
                 val ep = intf.getEndpoint(e)
@@ -245,7 +297,7 @@ class UsbOtgPrinterManager(private val context: Context) {
         try {
             conn.claimInterface(intf, true)
             val resetPayload = ByteArrayOutputStream().apply {
-                write(EpsonUsbProtocolEngine.buildEscprPageEnd(false))
+                write(EpsonUsbProtocolEngine.buildEscprPageEnd(0))
                 write(EpsonUsbProtocolEngine.buildEscprJobEnd())
                 write(byteArrayOf(0x0C, 0x1B, 0x40))
             }.toByteArray()
@@ -298,7 +350,11 @@ class UsbOtgPrinterManager(private val context: Context) {
             printer,
             config.paperSize
         )
-        val (targetW, targetH) = EpsonUsbProtocolEngine.getTargetPixelDimensions(activeProtocol, config.paperSize)
+        val (targetW, targetH) = EpsonUsbProtocolEngine.getTargetPixelDimensions(
+            activeProtocol,
+            config.paperSize,
+            borderless = (config.scaleMode == ScaleFitMode.MARGINLESS)
+        )
         val totalCopies = config.copies.coerceIn(1, 99)
         val totalPages = pages.size
         val totalSteps = totalPages * totalCopies
@@ -311,7 +367,7 @@ class UsbOtgPrinterManager(private val context: Context) {
             totalPages = totalPages,
             currentCopy = 1,
             totalCopies = totalCopies,
-            statusText = "Menyiapkan jalur USB OTG ke ${printer.displayName}...",
+            statusText = "Menyiapkan jalur USB OTG (${activeProtocol.name}) ke ${printer.displayName}...",
             progressFraction = 0.02f,
             bytesTransferred = 0L
         )
@@ -329,15 +385,11 @@ class UsbOtgPrinterManager(private val context: Context) {
                 ok
             }
 
-            // If ESC/P-R mode, send Job Header once before pages
-            if (activeProtocol == EpsonUsbProtocolEngine.resolveActiveProtocol(EpsonDriverProtocol.ESCPR, printer, config.paperSize) &&
-                activeProtocol == EpsonDriverProtocol.ESCPR
-            ) {
-                val pageW = if (config.orientation == PageOrientation.LANDSCAPE) maxOf(targetW, targetH) else minOf(targetW, targetH)
-                val pageH = if (config.orientation == PageOrientation.LANDSCAPE) minOf(targetW, targetH) else maxOf(targetW, targetH)
-                val jobHeader = EpsonUsbProtocolEngine.buildEscprJobStart(pageW, pageH, config)
+            // If ESC/P-R mode, send Job Header (REMOTE1 + ESCPR + setq + setj) once before pages
+            if (activeProtocol == EpsonDriverProtocol.ESCPR) {
+                val jobHeader = EpsonUsbProtocolEngine.buildEscprJobStart(config)
                 if (!sendRawChunk(jobHeader)) {
-                    throw Exception("Gagal mengirim header pekerjaan cetak ke printer via USB OTG.")
+                    throw Exception("Gagal mengirim inisialisasi pekerjaan cetak (ESC/P-R) via USB OTG.")
                 }
             }
 
@@ -349,6 +401,9 @@ class UsbOtgPrinterManager(private val context: Context) {
                     }
 
                     val humanPage = pageIdx + 1
+                    val overallPageNumber = completedSteps + 1
+                    val remainingPagesAfterThis = (totalSteps - overallPageNumber).coerceAtLeast(0)
+
                     _printProgress.value = _printProgress.value.copy(
                         currentPage = humanPage,
                         currentCopy = copyIndex,
@@ -364,11 +419,9 @@ class UsbOtgPrinterManager(private val context: Context) {
                         targetHeightPx = targetH
                     )
 
-                    val isLastPageOverall = (copyIndex == totalCopies) && (humanPage == totalPages)
-
                     val pageSuccess = when (activeProtocol) {
                         EpsonDriverProtocol.ESCPR, EpsonDriverProtocol.AUTO -> {
-                            sendRawChunk(EpsonUsbProtocolEngine.buildEscprPageStart()) &&
+                            sendRawChunk(EpsonUsbProtocolEngine.buildEscprPageStart(overallPageNumber)) &&
                                 EpsonUsbProtocolEngine.streamEscprPageBitmap(
                                     bitmap = renderedBitmap,
                                     config = config,
@@ -383,12 +436,13 @@ class UsbOtgPrinterManager(private val context: Context) {
                                     },
                                     sendChunk = sendRawChunk
                                 ) &&
-                                sendRawChunk(EpsonUsbProtocolEngine.buildEscprPageEnd(!isLastPageOverall))
+                                sendRawChunk(EpsonUsbProtocolEngine.buildEscprPageEnd(remainingPagesAfterThis))
                         }
 
                         EpsonDriverProtocol.ESCP2 -> {
                             EpsonUsbProtocolEngine.streamEscp2PageBitmap(
                                 bitmap = renderedBitmap,
+                                config = config,
                                 isCancelled = { cancelRequested.get() },
                                 onProgress = { pageFrac ->
                                     val overall = (completedSteps + pageFrac) / totalSteps.toFloat()
@@ -462,7 +516,7 @@ class UsbOtgPrinterManager(private val context: Context) {
         try {
             val abortBytes = when (protocol) {
                 EpsonDriverProtocol.ESCPR, EpsonDriverProtocol.AUTO -> {
-                    EpsonUsbProtocolEngine.buildEscprPageEnd(false) + EpsonUsbProtocolEngine.buildEscprJobEnd()
+                    EpsonUsbProtocolEngine.buildEscprPageEnd(0) + EpsonUsbProtocolEngine.buildEscprJobEnd()
                 }
                 else -> byteArrayOf(0x0C, 0x1B, 0x40)
             }

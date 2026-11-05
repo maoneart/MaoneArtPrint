@@ -89,7 +89,8 @@ data class ConnectedUsbPrinter(
     val productId: Int,
     val isEpson: Boolean,
     val hasPermission: Boolean,
-    val detectedCategory: String
+    val detectedCategory: String,
+    val ieee1284Cmd: String = ""
 )
 
 data class PrintProgressState(
