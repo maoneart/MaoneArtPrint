@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">MaoneArt Print</string>
+    <string name="print_service_label">MaoneArt Epson USB OTG Print</string>
+    <string name="print_service_description">Cetak langsung dokumen PDF, Foto, dan Struk ke Printer Epson via Kabel USB OTG</string>
+</resources>

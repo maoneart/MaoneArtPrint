@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Top Paper Input -->
+    <path
+        android:fillColor="#E2E8F0"
+        android:pathData="M34,24h40v18h-40z" />
+    <!-- Printer Body Cyan/Blue Accent -->
+    <path
+        android:fillColor="#00B4D8"
+        android:pathData="M24,40c-3.3,0 -6,2.7 -6,6v20c0,2.2 1.8,4 4,4h10v-8h44v8h10c2.2,0 4,-1.8 4,-4v-20c0,-3.3 -2.7,-6 -6,-6z" />
+    <!-- Status LED Green -->
+    <path
+        android:fillColor="#10B981"
+        android:pathData="M74,48a3,3 0,1 0,6 0a3,3 0,1 0,-6 0z" />
+    <!-- Printed Output Paper -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M34,58h40v26h-40z" />
+    <!-- Printed Color Lines (CMYK Bars) -->
+    <path
+        android:fillColor="#06B6D4"
+        android:pathData="M40,65h28v3h-28z" />
+    <path
+        android:fillColor="#EC4899"
+        android:pathData="M40,71h22v3h-22z" />
+    <path
+        android:fillColor="#F59E0B"
+        android:pathData="M40,77h16v3h-16z" />
+</vector>

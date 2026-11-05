@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<print-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:settingsActivity="id.maoneart.print.MainActivity"
+    android:addPrintersActivity="id.maoneart.print.MainActivity"
+    android:advancedPrintOptionsActivity="id.maoneart.print.MainActivity"
+    android:vendor="MaoneArt" />

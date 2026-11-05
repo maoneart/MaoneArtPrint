@@ -1,0 +1,60 @@
+name: Build MaoneArt Print APK
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build Android Release APK
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Java JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'gradle'
+
+      - name: Grant Execute Permission to Gradlew
+        run: chmod +x gradlew
+
+      - name: Build Android Release APK
+        run: ./gradlew assembleRelease --stacktrace
+
+      - name: Prepare APK Asset
+        run: |
+          mkdir -p release-output
+          cp app/build/outputs/apk/release/app-release.apk release-output/MaoneArtPrint.apk
+          ls -la release-output/
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MaoneArtPrint-apk
+          path: release-output/MaoneArtPrint.apk
+          retention-days: 14
+
+      - name: Create GitHub Release & Upload Asset
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/heads/main')
+        with:
+          tag_name: "v1.0.${{ github.run_number }}"
+          name: "MaoneArt Print (Epson USB OTG Studio) v1.0.${{ github.run_number }}"
+          body: |
+            ### 🖨️ MaoneArt Print — Epson USB OTG Studio (Tablet & Phone Release)
+            - **Direct USB OTG Epson Printing**: Cetak langsung ke printer Epson Inkjet/EcoTank (Seri L120, L121, L1110, L3110, L3210, L3250, L805, dll.) dan Epson Thermal POS (TM-Series) hanya bermodal kabel USB OTG.
+            - **Buka & Pilih Halaman PDF, JPG, PNG, WebP**: Pratinjau seluruh halaman dokumen PDF dan gambar, centang/pilih halaman tertentu atau rentang halaman (`1-3, 5`), putar 90°, dan perbesar sebelum cetak.
+            - **Pengaturan Cetak Lengkap**: Ukuran kertas A4, F4/Folio, Letter, Foto 4R/5R, Pas Foto 3x4 & 4x6 (4-up grid), Struk 80mm/58mm, Warna vs Hitam-Putih, dan jumlah rangkap.
+            - **Android System Print Service**: Terintegrasi langsung di menu "Print / Cetak" dan "Share / Buka Dengan" bawaan Android.
+          files: release-output/MaoneArtPrint.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

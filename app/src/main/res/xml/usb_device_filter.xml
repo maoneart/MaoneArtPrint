@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Seiko Epson Corporation (0x04B8 = 1208) -->
+    <usb-device vendor-id="1208" />
+    <!-- Generic USB Printer Class (Class 7) -->
+    <usb-device class="7" />
+</resources>

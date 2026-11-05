@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.MaoneArtPrint" parent="android:Theme.Material.NoActionBar">
+        <item name="android:statusBarColor">#FF080D1A</item>
+        <item name="android:navigationBarColor">#FF080D1A</item>
+    </style>
+</resources>
